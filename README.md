@@ -80,7 +80,7 @@ Where to find the vendor and project values of your device, from the original (s
   (JSON, properties `axon.gps.anld.config.epoVendor`, `epoProject`, `epoDeviceId`).
 * **They can be read from a raw MTD flash backup of the original firmware.** That file lives on the big
   writable `system` partition (the ~312 MiB one, `mtd9.bin` in a typical `mtd0.bin`...`mtd9.bin` dump taken from
-  the stock device, for example `Y:lash_backup\mtd9.bin`). The flash is a log-structured filesystem, so the
+  the stock device, for example `Y:\flash_backup\mtd9.bin`). The flash is a log-structured filesystem, so the
   settings file shows up as plain text, usually several times (older copies of the same file). The small
   partitions (`mtd0`-`mtd2` bootloader, U-Boot environment and device data, and the Wi-Fi calibration partition)
   do not contain them.
