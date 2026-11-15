@@ -1,0 +1,23 @@
+{
+	"luci-app-w1700k-gps": {
+		"description": "Grant access to LuCI app GPS (Gemtek W1700K)",
+		"read": {
+			"file": {
+				"/usr/libexec/w1700k-gps status": [ "exec" ],
+				"/usr/libexec/w1700k-gps info": [ "exec" ],
+				"/usr/libexec/w1700k-gps history": [ "exec" ],
+				"/usr/libexec/w1700k-gps sky": [ "exec" ],
+				"/usr/libexec/w1700k-gps serve-status": [ "exec" ],
+				"/usr/libexec/w1700k-gps-epo status": [ "exec" ]
+			},
+			"uci": [ "w1700k_gps" ]
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/w1700k-gps settime": [ "exec" ],
+				"/usr/libexec/w1700k-gps mqtt-import": [ "exec" ]
+			},
+			"uci": [ "w1700k_gps" ]
+		}
+	}
+}

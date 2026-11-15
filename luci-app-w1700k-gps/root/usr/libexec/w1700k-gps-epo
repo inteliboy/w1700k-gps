@@ -1,0 +1,289 @@
+#!/usr/bin/ucode
+// Satellite prediction (MediaTek EPO) for the Gemtek W1700K on-board GPS (Airoha AG3352). Opt-in.
+//   w1700k-gps-epo run      daemon loop (started by /etc/init.d/w1700k-gps-epo when enabled in UCI)
+//   w1700k-gps-epo send     send DIR/send.txt to the chip (internal; run under `timeout` by `run`)
+//   w1700k-gps-epo status   print the current state as JSON (no secrets)
+//
+// How it works (worked out from the stock firmware's `anld` behaviour):
+//  * http://<host>/EPO_GR_3_<n>.DAT?vendor=..&project=..&device_id=.. : 48384 bytes = 12 six-hour slots x 56
+//    records of 72 bytes (18 little-endian u32). Record word0 = GPS-hour stamp (low 24 bits) | satellite id (top
+//    byte). Per slot: 32 GPS records (id 1..32) then 24 GLONASS records (id 0x41..0x58). The ETag is the MD5.
+//  * The chip is given the records of the current slot as  $PAIR471,<type>,<id>,<18 words as %X>*XX  with
+//    type 0 = GPS, id = byte3 and type 1 = GLONASS, id = byte3 - 0x40. The chip answers $PAIR001,471,0 when it
+//    accepts a record and $PAIR001,471,4 when it rejects one.
+//  * Only volatile aiding data is sent; nothing is saved to the chip's flash. BeiDou and Galileo are not sent.
+// The credentials (vendor/project/device_id) live in /etc/config/w1700k_gps (mode 0600), never in the package.
+'use strict';
+import { popen, stat, mkdir, rmdir, readfile, writefile, unlink, open } from 'fs';
+import { cursor } from 'uci';
+
+const DEV = '/dev/ttyS2';
+const BAUD = 921600;
+const DIR = '/tmp/w1700k-gps-epo';
+const STATE = '/tmp/w1700k-gps-epo.state';
+const LOCK = '/tmp/w1700k-gps.lock';        /* shared with /usr/libexec/w1700k-gps: one user of the serial port */
+const GPS_EPOCH = 315964800;                /* 1980-01-06 00:00:00 UTC */
+const LEAP = 18;                            /* GPS time = UTC + 18 s (no leap second added since 2017) */
+const RECLEN = 72, GPS_N = 32, GLO_N = 24, SLOT_RECS = 56, SLOTS = 12;
+const FILELEN = SLOTS * SLOT_RECS * RECLEN; /* 48384 */
+const OK_INTERVAL = 30 * 60 * 1000;         /* push again every 30 min: the chip forgets everything on a reset */
+const RETRY_INTERVAL = 5 * 60 * 1000;
+
+function q(s) { return "'" + replace('' + s, "'", "'\\''") + "'"; }
+
+function sh(cmd) {
+	let p = popen(cmd + ' 2>&1', 'r');
+	if (!p)
+		return { out: '', code: 127 };
+	let out = p.read('all');
+	let code = p.close();
+	return { out: out ?? '', code: code };
+}
+
+function log(msg) { sh('logger -t w1700k-gps-epo ' + q(msg)); }
+
+function cfg() {
+	let c = cursor();
+	c.load('w1700k_gps');
+	let g = (k, d) => c.get('w1700k_gps', 'epo', k) ?? d;
+	return {
+		enabled: g('enabled', '0') == '1',
+		host: g('host', 'wpepodownload.mediatek.com'),
+		vendor: g('vendor', ''), project: g('project', ''), device_id: g('device_id', '')
+	};
+}
+
+function put_state(o) {
+	o.updated = time();
+	writefile(STATE, sprintf('%J', o));
+}
+
+/* little-endian u32 at offset o of string s */
+function u32(s, o) {
+	return ord(s, o) + ord(s, o + 1) * 256 + ord(s, o + 2) * 65536 + ord(s, o + 3) * 16777216;
+}
+
+function now_gps_hours() {
+	return int((time() - GPS_EPOCH + LEAP) / 3600);
+}
+
+/* returns { h0, data } if the data is a well-formed EPO_GR_3 file, else null */
+function validate(data) {
+	if (length(data) != FILELEN)
+		return null;
+	let h0 = u32(data, 0) & 0xffffff;
+	for (let s = 0; s < SLOTS; s++) {
+		let want = h0 + 6 * s;
+		for (let i = 0; i < SLOT_RECS; i++) {
+			let o = (s * SLOT_RECS + i) * RECLEN;
+			if ((u32(data, o) & 0xffffff) != want)
+				return null;
+			let id = ord(data, o + 3);
+			if (i < GPS_N ? id != i + 1 : id != 0x41 + (i - GPS_N))
+				return null;
+		}
+	}
+	return { h0: h0, data: data };
+}
+
+/* get EPO_GR_3_<n>.DAT: from the RAM cache while it still covers the present, else download and verify it */
+function get_file(c, n) {
+	let name = 'EPO_GR_3_' + n + '.DAT';
+	let path = DIR + '/' + name;
+	let cached = stat(path) ? validate(readfile(path)) : null;
+	if (cached && now_gps_hours() - cached.h0 <= 6 * (SLOTS - 1) + 5)
+		return cached;
+	if (!c.vendor || !c.project || !c.device_id)
+		return { error: 'the vendor, project and device ID are not set' };
+	sh('mkdir -p ' + DIR);
+	/* the URL carries the credentials: give it to curl through a 0600 file, not the command line */
+	let cf = DIR + '/curl.cfg';
+	writefile(cf, 'url = "http://' + c.host + '/' + name + '?vendor=' + c.vendor + '&project=' + c.project +
+		'&device_id=' + c.device_id + '"\n');
+	sh('chmod 600 ' + q(cf));
+	let r = sh('curl -sS -m 60 -K ' + q(cf) + ' -D ' + q(DIR + '/head.txt') + ' -o ' + q(path + '.new') + ' -w "%{http_code}"');
+	unlink(cf);
+	let code = trim(r.out);
+	if (r.code != 0 || code != '200') {
+		unlink(path + '.new');
+		return { error: 'download of ' + name + ' failed (HTTP ' + (code || '?') + ')' };
+	}
+	let etag = match(readfile(DIR + '/head.txt') ?? '', /[Ee][Tt]ag: "([0-9a-f]{32})"/);
+	let md5 = split(sh('md5sum ' + q(path + '.new')).out, ' ')[0];
+	if (!etag || etag[1] != md5) {
+		unlink(path + '.new');
+		return { error: name + ': MD5 does not match the ETag' };
+	}
+	let f = validate(readfile(path + '.new'));
+	if (!f) {
+		unlink(path + '.new');
+		return { error: name + ' has an unexpected layout' };
+	}
+	sh('mv ' + q(path + '.new') + ' ' + q(path));
+	log('downloaded ' + name + ' (' + length(f.data) + ' bytes, starts at GPS hour ' + f.h0 + ')');
+	return f;
+}
+
+function body(type, id, data, o) {
+	let w = [];
+	for (let k = 0; k < 18; k++)
+		push(w, sprintf('%X', u32(data, o + 4 * k)));
+	return sprintf('PAIR471,%X,%X,', type, id) + join(',', w);
+}
+
+function frame(b) {
+	let cs = 0;
+	for (let i = 0; i < length(b); i++)
+		cs ^= ord(b, i);
+	return sprintf('$%s*%02X', b, cs);
+}
+
+/* the sentences for one 6-hour slot: 32 GPS + 24 GLONASS records */
+function sentences(f, slot) {
+	let out = [];
+	for (let i = 0; i < SLOT_RECS; i++) {
+		let o = (slot * SLOT_RECS + i) * RECLEN;
+		let b4 = ord(f.data, o + 3);
+		push(out, frame(i < GPS_N ? body(0, b4, f.data, o) : body(1, b4 - 0x40, f.data, o)));
+	}
+	return out;
+}
+
+/* internal: send DIR/send.txt, each sentence right after an NMEA line starts, with ONE reader on the port */
+function send() {
+	let lines = split(trim(readfile(DIR + '/send.txt') ?? ''), '\n');
+	let r = sh('stty -F ' + DEV + ' ' + BAUD + ' raw clocal -crtscts -hupcl -echo cs8 -parenb -cstopb');
+	if (r.code != 0)
+		return { ok: false, error: 'stty failed: ' + trim(r.out) };
+	let rd = open(DEV, 'r'), wr = open(DEV, 'w');
+	if (!rd || !wr)
+		return { ok: false, error: 'cannot open ' + DEV };
+	let acks = { ok: 0, rejected: 0 }, sent = 0;
+	let scan = function(l) {
+		let m = match(l, /\$PAIR001,471,([0-9]+)\*/);
+		if (m) {
+			let k = (m[1] == '0') ? 'ok' : 'rejected';
+			acks[k] = acks[k] + 1;
+		}
+	};
+	for (let s in lines) {
+		for (let n = 0; n < 400; n++) {
+			let l = rd.read('line');
+			if (l == null)
+				break;
+			scan(l);
+			if (substr(l, 0, 1) == '$')
+				break;
+		}
+		wr.write(s + '\r\n');
+		wr.flush();
+		sent++;
+		sleep(10);
+	}
+	for (let n = 0; n < 120; n++) {      /* collect the late acknowledgements */
+		let l = rd.read('line');
+		if (l == null)
+			break;
+		scan(l);
+	}
+	rd.close();
+	wr.close();
+	return { ok: true, sent: sent, acks_ok: acks.ok, acks_rejected: acks.rejected };
+}
+
+function with_lock(fn) {
+	for (let t = 0; t < 30; t++) {
+		if (mkdir(LOCK, 0700)) {
+			let r = fn();
+			rmdir(LOCK);
+			return r;
+		}
+		if (sh('find ' + q(LOCK) + ' -maxdepth 0 -mmin +3').out != '')
+			sh('rmdir ' + q(LOCK));      /* left behind by a dead run */
+		sleep(2000);
+	}
+	return { ok: false, error: 'the serial port stayed busy' };
+}
+
+function cycle(c) {
+	if (time() < 1700000000)
+		return { ok: false, error: 'the router clock is not set yet', wait: 60000 };
+	let now_h = now_gps_hours();
+	let f = get_file(c, 1);
+	if (f.error)
+		return { ok: false, error: f.error };
+	let n = 1;
+	if (now_h - f.h0 > 6 * (SLOTS - 1) + 5) {
+		n = int((now_h - f.h0) / (6 * SLOTS)) + 1;       /* 72 h per file */
+		f = get_file(c, n);
+		if (f.error)
+			return { ok: false, error: f.error };
+	}
+	let slot = int((now_h - f.h0) / 6);
+	if (slot < 0 || slot >= SLOTS)
+		return { ok: false, error: 'no EPO slot covers the present (GPS hour ' + now_h + ', file starts ' + f.h0 + ')' };
+	writefile(DIR + '/send.txt', join('\n', sentences(f, slot)) + '\n');
+	let r = with_lock(() => {
+		let o = sh('timeout 120 /usr/libexec/w1700k-gps-epo send');
+		try {
+			return json(trim(o.out));
+		} catch (e) {
+			return { ok: false, error: 'sender failed: ' + trim(o.out) };
+		}
+	});
+	unlink(DIR + '/send.txt');
+	if (!r.ok)
+		return r;
+	r.file = 'EPO_GR_3_' + n + '.DAT';
+	r.slot = slot;
+	r.slot_start = f.h0 + 6 * slot;     /* GPS hour */
+	return r;
+}
+
+function run() {
+	for (;;) {
+		let c = cfg();
+		if (!c.enabled)
+			return;
+		let r;
+		try {
+			r = cycle(c);
+		} catch (e) {
+			r = { ok: false, error: 'internal error: ' + e };
+		}
+		let wait = r.ok ? OK_INTERVAL : (r.wait ?? RETRY_INTERVAL);
+		r.next = time() + int(wait / 1000);
+		put_state(r);
+		log(r.ok ? sprintf('sent %d records of %s slot %d, %d accepted, %d rejected', r.sent, r.file, r.slot, r.acks_ok, r.acks_rejected)
+		         : 'failed: ' + r.error);
+		sleep(wait);
+	}
+}
+
+function status() {
+	let c = cfg();
+	let st = {};
+	try {
+		st = json(readfile(STATE) ?? '{}');
+	} catch (e) {
+		st = {};
+	}
+	st.enabled = c.enabled;
+	st.configured = !!(c.vendor && c.project && c.device_id);
+	st.host = c.host;
+	return st;
+}
+
+switch (ARGV[0]) {
+case 'run':
+	run();
+	break;
+case 'send':
+	print(sprintf('%J', send()) + '\n');
+	break;
+case 'status':
+	print(sprintf('%J', status()) + '\n');
+	break;
+default:
+	print('usage: w1700k-gps-epo run|send|status\n');
+}

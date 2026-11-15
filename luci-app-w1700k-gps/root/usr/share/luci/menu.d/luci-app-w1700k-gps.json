@@ -1,0 +1,18 @@
+{
+	"admin/services/w1700k_gps": {
+		"title": "GPS",
+		"order": 70,
+		"action": { "type": "firstchild" },
+		"depends": { "acl": [ "luci-app-w1700k-gps" ] }
+	},
+	"admin/services/w1700k_gps/status": {
+		"title": "Status",
+		"order": 10,
+		"action": { "type": "view", "path": "w1700k_gps/main" }
+	},
+	"admin/services/w1700k_gps/epo": {
+		"title": "Settings",
+		"order": 20,
+		"action": { "type": "view", "path": "w1700k_gps/epo" }
+	}
+}

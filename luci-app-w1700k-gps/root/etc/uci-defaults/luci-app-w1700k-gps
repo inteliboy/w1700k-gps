@@ -1,0 +1,40 @@
+#!/bin/sh
+# First install / upgrade defaults for luci-app-w1700k-gps. Only fills in what is missing, never overwrites.
+[ -f /etc/config/w1700k_gps ] || { touch /etc/config/w1700k_gps; }
+chmod 600 /etc/config/w1700k_gps
+
+uci -q batch <<UCI
+set w1700k_gps.epo=epo
+set w1700k_gps.clock=clock
+set w1700k_gps.position=position
+set w1700k_gps.serve=serve
+set w1700k_gps.ntp=ntp
+set w1700k_gps.mqtt=mqtt
+UCI
+def() { [ -n "$(uci -q get "w1700k_gps.$1")" ] || uci set "w1700k_gps.$1=$2"; }
+def epo.enabled 0
+def epo.host wpepodownload.mediatek.com
+# random per device (43 characters of base64url, like the stock one)
+def epo.device_id "$(tr -dc 'A-Za-z0-9_-' </dev/urandom | head -c 43)"
+def clock.auto 0
+def position.auto 0
+def serve.nmea_enabled 0
+def serve.nmea_port 10110
+def serve.gpsd_enabled 0
+def serve.gpsd_port 2947
+def ntp.enabled 0
+def ntp.port 123
+def mqtt.enabled 0
+def mqtt.port 1883
+def mqtt.base w1700k_gps
+def mqtt.prefix homeassistant
+def mqtt.discovery 1
+def mqtt.interval 30
+uci commit w1700k_gps
+chmod 600 /etc/config/w1700k_gps
+
+for s in w1700k-gps-epo w1700k-gps-hist w1700k-gps-serve; do
+	/etc/init.d/$s enable
+	/etc/init.d/$s restart >/dev/null 2>&1
+done
+exit 0

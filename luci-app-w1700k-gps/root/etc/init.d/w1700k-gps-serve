@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+# Opt-in GPS sharing: NMEA over TCP, gpsd protocol, MQTT with Home Assistant discovery, SNTP time source.
+# Nothing is started (and nothing listens) unless a feature is enabled in /etc/config/w1700k_gps.
+
+START=97
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	local nmea gpsd mqtt ntp
+	nmea=$(uci -q get w1700k_gps.serve.nmea_enabled)
+	gpsd=$(uci -q get w1700k_gps.serve.gpsd_enabled)
+	mqtt=$(uci -q get w1700k_gps.mqtt.enabled)
+	ntp=$(uci -q get w1700k_gps.ntp.enabled)
+	rm -f /tmp/w1700k-gps.burst /tmp/w1700k-gps.serve.json /tmp/w1700k-gps.time /tmp/w1700k-gps.ntp.json
+	if [ "$nmea" = 1 ] || [ "$gpsd" = 1 ] || [ "$mqtt" = 1 ] || [ "$ntp" = 1 ]; then
+		procd_open_instance run
+		procd_set_param command /usr/libexec/w1700k-gps-serve run
+		procd_set_param respawn 3600 10 5
+		procd_set_param stderr 1
+		procd_close_instance
+	fi
+	if [ "$ntp" = 1 ]; then
+		procd_open_instance ntp
+		procd_set_param command /usr/libexec/w1700k-gps-serve ntp
+		procd_set_param respawn 3600 10 5
+		procd_set_param stderr 1
+		procd_close_instance
+	fi
+}
+
+stop_service() {
+	rm -f /tmp/w1700k-gps.burst /tmp/w1700k-gps.serve.json /tmp/w1700k-gps.time /tmp/w1700k-gps.ntp.json
+}
+
+service_triggers() {
+	procd_add_reload_trigger w1700k_gps
+}

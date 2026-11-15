@@ -1,0 +1,413 @@
+#!/usr/bin/ucode
+// Root-side helper of luci-app-w1700k-gps. It only reads, with one exception: `info` sends the chip a single
+// $PAIR020 version query (a GET that changes nothing) and caches the answer.
+//   w1700k-gps status   read ~2 s of NMEA from the on-board GPS and print one JSON object
+//   w1700k-gps info     receiver firmware string, build date (asks the chip once per boot)
+//   w1700k-gps settime  set the system clock from the GPS time of the next valid fix (refuses without a fix)
+//   w1700k-gps sample   one status read appended to the RAM-only history (/tmp); run once a minute by the
+//                       w1700k-gps-hist service; with clock.auto=1 it also corrects a clock that is >5 s off
+//   w1700k-gps sky      sky coverage map (RAM), serve-status / mqtt-import: see the serve daemon
+//   w1700k-gps history  the stored samples plus time-to-first-fix figures (reads a file, never the port)
+// Always exits 0; failures are {"ok":false,"error":"..."}.
+// The Airoha AG3352 chip is on /dev/ttyS2 at 921600 8N1 and sends NMEA once a second. The port is
+// configured with stty on every call (the setting is not persistent and nothing else uses the port).
+'use strict';
+import { popen, stat, mkdir, rmdir, readfile, writefile, unlink, open } from 'fs';
+import { q, sh, num, parse, local_time, gps_epoch, MIN_EPOCH, analyze } from 'w1700k_gps';
+
+const DEV = '/dev/ttyS2';
+const BAUD = 921600;
+const READ_SECS = 2;
+const LOCK = '/tmp/w1700k-gps.lock';
+
+function fail(msg) {
+	return { ok: false, error: msg };
+}
+
+/* set the system clock to a unix epoch (UTC); returns an error string or null */
+function apply_epoch(ep) {
+	if (ep == null || ep < MIN_EPOCH || ep > 4102444800)
+		return 'the GPS time is not plausible, not setting the clock';
+	let t = gmtime(ep);
+	let r = sh('date -u -s ' + q(sprintf('%04d-%02d-%02d %02d:%02d:%02d', t.year, t.mon, t.mday, t.hour, t.min, t.sec)));
+	if (r.code != 0)
+		return 'date -s failed: ' + trim(r.out);
+	return null;
+}
+
+function uptime() {
+	return int(+split(readfile('/proc/uptime') ?? '0', ' ')[0]);
+}
+
+
+/* The serve daemon (w1700k-gps-serve) owns the port while it runs and keeps the last couple of seconds of NMEA in
+   this file; status then reads the file and never touches the port. No fresh file = no daemon: read the port. */
+const BURST = '/tmp/w1700k-gps.burst';
+
+function burst_fresh() {
+	let b = stat(BURST);
+	if (!b)
+		return false;
+	let d = time() - b.mtime;
+	return d >= -5 && d <= 5;
+}
+
+function status() {
+	let lines;
+	if (burst_fresh()) {
+		lines = split(readfile(BURST) ?? '', '
+');
+	} else {
+		if (!stat(DEV))
+			return fail(DEV + ' does not exist; this kernel has no GPS UART (is this a Gemtek W1700K?)');
+		if (sh('command -v stty').code != 0)
+			return fail('stty is missing: install coreutils-stty (the glibc build for this firmware)');
+		let r = sh('stty -F ' + DEV + ' ' + BAUD + ' raw -echo cs8 -parenb -cstopb');
+		if (r.code != 0)
+			return fail('could not configure ' + DEV + ': ' + trim(r.out));
+		r = sh('timeout ' + READ_SECS + ' cat ' + DEV);
+		lines = split(r.out, '
+');
+	}
+	let o = analyze(lines);
+	o.device = DEV;
+	o.baud = BAUD;
+	if (o.sentences == 0)
+		o.warning = 'no valid NMEA received from ' + DEV + ' in ' + READ_SECS + ' s (wrong baud, chip asleep or port busy)';
+	return o;
+}
+
+/* NMEA checksum of a sentence body (the text between '$' and '*'), two upper-case hex digits */
+function checksum(body) {
+	let c = 0;
+	for (let i = 0; i < length(body); i++)
+		c ^= ord(body, i);
+	return sprintf('%02X', c);
+}
+
+/* Receiver firmware string, from the one query this app ever sends: $PAIR020 (PAIR_GET_VERSION), a pure GET that
+   changes nothing on the chip. The chip only listens right after it starts an NMEA burst, so the sentence is
+   sent after a '$' is seen (same as gps-cli). The answer never changes while the chip is powered, so it is cached
+   in /tmp and the chip is asked once per boot. */
+const INFO_CACHE = '/tmp/w1700k-gps.info';
+const INFO_RAW = '/tmp/w1700k-gps.info.raw';
+
+function chip_info() {
+	let c = readfile(INFO_CACHE);
+	if (c) {
+		try {
+			return json(c);
+		} catch (e) {
+			/* unreadable cache: ask the chip again */
+		}
+	}
+	if (!stat(DEV))
+		return fail(DEV + ' does not exist');
+	if (sh('command -v stty').code != 0)
+		return fail('stty is missing: install coreutils-stty (the glibc build for this firmware)');
+	let r = sh('stty -F ' + DEV + ' ' + BAUD + ' raw clocal -crtscts -hupcl -echo cs8 -parenb -cstopb');
+	if (r.code != 0)
+		return fail('could not configure ' + DEV + ': ' + trim(r.out));
+	let body = 'PAIR020';
+	let script = 'exec 3<>' + DEV + '; (timeout 6 cat ' + DEV + ' > ' + INFO_RAW + ') & sleep 1; n=0; ' +
+		'while [ $n -lt 40 ]; do read -r l <&3; case "$l" in \'$\'*) break;; esac; n=$((n+1)); done; ' +
+		'printf \'$' + body + '*' + checksum(body) + '\\r\\n\' >&3; sleep 3; exec 3>&-';
+	sh('timeout 15 sh -c ' + q(script));
+	let raw = readfile(INFO_RAW) ?? '';
+	unlink(INFO_RAW);
+	for (let l in split(raw, '\n')) {
+		let at = index(l, '$PAIR020,');
+		if (at < 0)
+			continue;
+		let f = parse(substr(l, at));
+		if (!f || !f[1])
+			continue;
+		let o = { ok: true, firmware: f[1] };
+		let d = match(f[1], /(\d{4})(\d{2})(\d{2})$/);
+		if (d)
+			o.build_date = d[1] + '-' + d[2] + '-' + d[3];
+		let v = match(f[1], /_V([0-9]+(\.[0-9]+)*)/);
+		if (v)
+			o.version = v[1];
+		writefile(INFO_CACHE, sprintf('%J', o));
+		return o;
+	}
+	return fail('the receiver did not answer the version query');
+}
+
+/* Set the clock from the first valid RMC sentence (status A) of a fresh read: the time is applied the moment the
+   sentence is parsed, so the error is the receiver's output delay (a fraction of a second), not the 2 s read. */
+function set_clock() {
+	if (!stat(DEV))
+		return fail(DEV + ' does not exist');
+	if (sh('command -v stty').code != 0)
+		return fail('stty is missing: install coreutils-stty (the glibc build for this firmware)');
+	let r = sh('stty -F ' + DEV + ' ' + BAUD + ' raw -echo cs8 -parenb -cstopb');
+	if (r.code != 0)
+		return fail('could not configure ' + DEV + ': ' + trim(r.out));
+	let p = popen('timeout 6 cat ' + DEV, 'r');
+	if (!p)
+		return fail('could not read ' + DEV);
+	let res = null, bad = null;
+	for (let n = 0; n < 60 && !res && !bad; n++) {
+		let l = p.read('line');
+		if (l == null)
+			break;
+		let at = index(l, '$');
+		if (at < 0)
+			continue;
+		let f = parse(substr(l, at));
+		if (!f || substr(f[0], 2) != 'RMC' || f[2] != 'A' || length(f[1]) < 6 || length(f[9]) != 6)
+			continue;
+		let ep = gps_epoch('20' + substr(f[9], 4, 2) + '-' + substr(f[9], 2, 2) + '-' + substr(f[9], 0, 2),
+			substr(f[1], 0, 2) + ':' + substr(f[1], 2, 2) + ':' + substr(f[1], 4, 2));
+		let before = time();
+		bad = apply_epoch(ep);
+		if (!bad)
+			res = { ok: true, before: before, after: time(), gps: ep, step: ep - before };
+	}
+	p.close();
+	if (bad)
+		return fail(bad);
+	if (!res)
+		return fail('no satellite fix (no valid RMC sentence with status A in 6 s): the clock was not changed');
+	sh('logger -t w1700k-gps ' + q('system clock set from GPS, was ' + res.step + ' s off'));
+	return res;
+}
+
+/* RAM-only history. One line per sample: uptime_s fix used view hdop snr_avg. Uptime, not wall time, so the
+   history stays valid when the clock is set (the router may boot with a 1970 clock and no RTC). */
+const HIST = '/tmp/w1700k-gps.hist';
+const HIST_MAX = 1440;      /* one a minute = 24 h */
+const HIST_STEP = 60;
+
+/* position.auto=1: keep the last good fix as the "last known position" in /etc/config/w1700k_gps, shown on the map
+   while there is no fix. Flash wear guard: only a 3D fix with HDOP <= 3, only when it is >~250 m from what is
+   stored (or nothing is stored), and at most once an hour. A router that does not move writes this once. */
+const POS_MARK = '/tmp/w1700k-gps.possaved';
+
+function remember(o) {
+	if (!o.fix || o.fix_type < 3 || o.lat == null || o.lon == null || (o.hdop ?? 99) > 3)
+		return;
+	if (trim(sh('uci -q get w1700k_gps.position.auto').out) != '1')
+		return;
+	let la = num(trim(sh('uci -q get w1700k_gps.position.lat').out));
+	let lo = num(trim(sh('uci -q get w1700k_gps.position.lon').out));
+	if (la != null && lo != null) {
+		let dla = o.lat - la, dlo = o.lon - lo;
+		if (dla < 0.0025 && dla > -0.0025 && dlo < 0.004 && dlo > -0.004)
+			return;
+	}
+	if (stat(POS_MARK) && sh('find ' + q(POS_MARK) + ' -mmin +60').out == '')
+		return;
+	let t = time();
+	sh('uci set w1700k_gps.position.lat=' + q(o.lat) + ' && uci set w1700k_gps.position.lon=' + q(o.lon) +
+		' && uci set w1700k_gps.position.source=fix && uci set w1700k_gps.position.saved=' + q(t >= MIN_EPOCH ? t : 0) +
+		' && uci commit w1700k_gps && chmod 600 /etc/config/w1700k_gps');
+	writefile(POS_MARK, '1');
+	sh('logger -t w1700k-gps ' + q('last known position saved'));
+}
+
+/* Sky coverage map, RAM only: for each 15 degree azimuth x 10 degree elevation cell, how many samples a satellite was
+   listed there (seen), how often it had a signal (trk) and the summed SNR of those (snr). Satellites cross the sky
+   over hours, so a cell that is often occupied but never heard is a direction the antenna cannot see. */
+const SKY = '/tmp/w1700k-gps.sky';
+const SKY_AZ = 24;
+const SKY_EL = 9;
+
+function sky_new() {
+	let z = () => {
+		let a = [];
+		for (let i = 0; i < SKY_AZ * SKY_EL; i++)
+			push(a, 0);
+		return a;
+	};
+	return { az: SKY_AZ, el: SKY_EL, n: 0, since: uptime(), seen: z(), trk: z(), snr: z() };
+}
+
+function sky_load() {
+	let sk = null;
+	try {
+		sk = json(readfile(SKY) ?? '');
+	} catch (e) {
+		sk = null;
+	}
+	if (type(sk) != 'object' || length(sk.seen) != SKY_AZ * SKY_EL || length(sk.trk) != length(sk.seen) || length(sk.snr) != length(sk.seen))
+		sk = sky_new();
+	return sk;
+}
+
+function sky_update(o) {
+	let sk = sky_load();
+	let any = false;
+	for (let s in o.satellites) {
+		if (s.elevation == null || s.azimuth == null || s.elevation < 0 || s.elevation > 90)
+			continue;
+		let ai = int(s.azimuth / (360 / SKY_AZ)) % SKY_AZ;
+		let ei = int(s.elevation / 10);
+		if (ei >= SKY_EL)
+			ei = SKY_EL - 1;
+		let i = ei * SKY_AZ + ai;
+		sk.seen[i]++;
+		if (s.snr != null && s.snr > 0) {
+			sk.trk[i]++;
+			sk.snr[i] += s.snr;
+		}
+		any = true;
+	}
+	if (any) {
+		sk.n++;
+		writefile(SKY + '.new', sprintf('%J', sk));
+		sh('mv ' + SKY + '.new ' + SKY);
+	}
+}
+
+function sky() {
+	let sk = sky_load();
+	sk.ok = true;
+	sk.uptime = uptime();
+	return sk;
+}
+
+function sample() {
+	let o = status();
+	if (!o.ok)
+		return o;
+	let line = sprintf('%d %d %d %d %s %s\n', uptime(), (o.fix && o.fix_type >= 2) ? 1 : 0, o.sats_used, o.sats_in_view,
+		o.hdop ?? '-', o.snr_avg ?? '-');
+	let f = open(HIST, 'a');
+	if (f) {
+		f.write(line);
+		f.close();
+	}
+	let n = +trim(sh('wc -l < ' + HIST).out);
+	if (n > HIST_MAX + 60)
+		sh('tail -n ' + HIST_MAX + ' ' + HIST + ' > ' + HIST + '.new && mv ' + HIST + '.new ' + HIST);
+	let res = { ok: true, fix: o.fix };
+	remember(o);
+	sky_update(o);
+	if (o.clock_offset != null && (o.clock_offset > 5 || o.clock_offset < -5) &&
+	    trim(sh('uci -q get w1700k_gps.clock.auto').out) == '1') {
+		let err = apply_epoch(o.epoch);
+		if (!err) {
+			res.clock_set = o.clock_offset;
+			sh('logger -t w1700k-gps ' + q('system clock set from GPS, was ' + (-o.clock_offset) + ' s off (auto)'));
+		}
+	}
+	return res;
+}
+
+/* what the serve daemon last wrote about itself (clients, MQTT, NTP, time quality) */
+const SERVE_STATE = '/tmp/w1700k-gps.serve.json';
+
+function serve_status() {
+	let st = stat(SERVE_STATE);
+	let o = { ok: true, running: false };
+	if (!st)
+		return o;
+	let d = time() - st.mtime;
+	try {
+		let j = json(readfile(SERVE_STATE));
+		for (let k in j)
+			o[k] = j[k];
+	} catch (e) {
+		/* partial write: report not running this time */
+	}
+	o.running = d >= -15 && d <= 15;
+	return o;
+}
+
+/* copy host/port/user/password of the Zigbee gateway's MQTT broker (multiprotocol app) into w1700k_gps.mqtt */
+function mqtt_import() {
+	let j = null;
+	try {
+		j = json(readfile('/etc/w1700k-radio/mqtt.json') ?? '');
+	} catch (e) {
+		j = null;
+	}
+	if (type(j) != 'object' || type(j.host) != 'string' || j.host == '')
+		return fail('the Zigbee gateway has no MQTT broker configured (Services > Multiprotocol)');
+	let cmd = 'uci -q set w1700k_gps.mqtt=mqtt && uci set w1700k_gps.mqtt.host=' + q(j.host) +
+		' && uci set w1700k_gps.mqtt.port=' + q(type(j.port) == 'int' ? j.port : 1883);
+	cmd += ' && uci -q delete w1700k_gps.mqtt.user; uci -q delete w1700k_gps.mqtt.pass';
+	if (j.user != null && j.user != '') {
+		cmd += '; uci set w1700k_gps.mqtt.user=' + q(j.user);
+		if (j.pass != null)
+			cmd += '; uci set w1700k_gps.mqtt.pass=' + q(j.pass);
+	}
+	cmd += '; uci commit w1700k_gps && chmod 600 /etc/config/w1700k_gps';
+	let r = sh(cmd);
+	if (r.code != 0)
+		return fail('could not save: ' + trim(r.out));
+	return { ok: true, host: j.host, port: type(j.port) == 'int' ? j.port : 1883, user: j.user ?? null, has_password: j.pass != null && j.pass != '' };
+}
+
+function history() {
+	let samples = [];
+	for (let l in split(readfile(HIST) ?? '', '\n')) {
+		let f = split(trim(l), ' ');
+		if (length(f) != 6)
+			continue;
+		push(samples, [ int(f[0]), int(f[1]), int(f[2]), int(f[3]), f[4] == '-' ? null : +f[4], f[5] == '-' ? null : +f[5] ]);
+	}
+	let o = { ok: true, uptime: uptime(), step: HIST_STEP, samples: samples,
+		first_sample: length(samples) ? samples[0][0] : null,
+		first_fix: null, first_fix_exact: false, lost_at: null, reacquired_s: null, fix_now: false, since: null };
+	let prev = null;
+	for (let i = 0; i < length(samples); i++) {
+		let sm = samples[i];
+		if (sm[1] && o.first_fix == null) {
+			o.first_fix = sm[0];
+			o.first_fix_exact = i > 0;     /* a fix already in the very first sample is only an upper bound */
+		}
+		if (prev != null && prev[1] != sm[1]) {
+			o.since = sm[0];
+			if (!sm[1])
+				o.lost_at = sm[0];
+			else if (o.lost_at != null)
+				o.reacquired_s = sm[0] - o.lost_at;
+		}
+		prev = sm;
+	}
+	if (prev != null)
+		o.fix_now = prev[1] == 1;
+	return o;
+}
+
+let result;
+let locked = false;
+if (ARGV[0] == 'history') {
+	result = history();
+} else if (ARGV[0] == 'sky') {
+	result = sky();
+} else if (ARGV[0] == 'serve-status') {
+	result = serve_status();
+} else if (ARGV[0] == 'mqtt-import') {
+	result = mqtt_import();
+} else if (ARGV[0] != 'status' && ARGV[0] != 'info' && ARGV[0] != 'settime' && ARGV[0] != 'sample') {
+	result = fail('usage: w1700k-gps status|info|settime|sample|history|sky|serve-status|mqtt-import');
+} else if ((ARGV[0] == 'status' || ARGV[0] == 'sample') && burst_fresh()) {
+	/* the daemon has the port; the burst file needs no lock */
+} else {
+	locked = mkdir(LOCK, 0700);
+	if (!locked) {
+		/* only one reader at a time: two readers would split the bytes of the single serial stream.
+		   A lock older than a minute belongs to a dead run. */
+		if (sh('find ' + q(LOCK) + ' -maxdepth 0 -mmin +1').out != '') {
+			sh('rmdir ' + q(LOCK));
+			locked = mkdir(LOCK, 0700);
+		}
+		if (!locked)
+			result = fail('another reader is busy, retrying');
+	}
+}
+if (!result) {
+	try {
+		result = ARGV[0] == 'info' ? chip_info() : ARGV[0] == 'settime' ? set_clock() : ARGV[0] == 'sample' ? sample() : status();
+	} catch (e) {
+		result = fail('internal error: ' + e);
+	}
+}
+if (locked)
+	rmdir(LOCK);
+print(sprintf('%J', result) + '\n');

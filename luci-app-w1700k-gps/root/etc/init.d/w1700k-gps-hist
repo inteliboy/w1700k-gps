@@ -1,0 +1,14 @@
+#!/bin/sh /etc/rc.common
+# RAM-only GPS history sampler: one status read a minute into /tmp/w1700k-gps.hist (fix chart, time to first fix).
+# With w1700k_gps.clock.auto=1 the same call also corrects a system clock that is more than 5 s off.
+
+START=96
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /bin/sh -c 'while :; do /usr/libexec/w1700k-gps sample >/dev/null 2>&1; sleep 60; done'
+	procd_set_param respawn 3600 60 5
+	procd_close_instance
+}

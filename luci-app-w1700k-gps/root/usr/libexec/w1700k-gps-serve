@@ -1,0 +1,492 @@
+#!/usr/bin/ucode
+// Serve daemon of luci-app-w1700k-gps. Everything here is opt-in (/etc/config/w1700k_gps) and only runs when at
+// least one of the features below is enabled; it never writes a command to the receiver.
+//   w1700k-gps-serve run   owns the serial port (it yields it whenever /tmp/w1700k-gps.lock exists, which the
+//                          EPO sender, `info` and `settime` take), and
+//                            - keeps the last seconds of NMEA in /tmp/w1700k-gps.burst (the status page reads it),
+//                            - serves the raw NMEA stream over TCP        (w1700k_gps.serve.nmea_*)
+//                            - speaks the gpsd JSON protocol (TPV, SKY)   (w1700k_gps.serve.gpsd_*)
+//                            - publishes to MQTT with Home Assistant discovery (w1700k_gps.mqtt.*)
+//                            - measures how the receiver's time compares with the router clock
+//   w1700k-gps-serve ntp   SNTP server, stratum 1, "GPS" reference, answering with GPS-corrected time (w1700k_gps.ntp.*)
+// There is no PPS line on this board (no /dev/pps*), so the time comes from the NMEA text: good to roughly a
+// tenth of a second, which the page shows as measured jitter. Not a precision time source.
+// Test hooks: W1700K_GPS_DEV (serial device, e.g. a pty), W1700K_GPS_CONF (uci config dir).
+'use strict';
+import * as fs from 'fs';
+import * as socket from 'socket';
+import { cursor } from 'uci';
+import { abs } from 'math';
+import { q, sh, num, parse, gps_epoch, MIN_EPOCH, analyze } from 'w1700k_gps';
+
+const DEV = getenv('W1700K_GPS_DEV') ?? '/dev/ttyS2';
+const FAKE = getenv('W1700K_GPS_DEV') != null;
+const BAUD = 921600;
+const LOCK = '/tmp/w1700k-gps.lock';
+const BURST = '/tmp/w1700k-gps.burst';
+const STATE = '/tmp/w1700k-gps.serve.json';
+const TIMEF = '/tmp/w1700k-gps.time';
+const NTPSTATE = '/tmp/w1700k-gps.ntp.json';
+const MAXC = 8;
+
+function now() {
+	let c = clock();
+	return c[0] + c[1] / 1e9;
+}
+
+function mono_ms() {
+	let c = clock(true);
+	return c[0] * 1000 + int(c[1] / 1e6);
+}
+
+function put(path, obj) {
+	fs.writefile(path + '.new', sprintf('%J', obj));
+	fs.rename(path + '.new', path);
+}
+
+function load_cfg() {
+	let cd = getenv('W1700K_GPS_CONF');
+	let c = cd ? cursor(cd) : cursor();
+	c.load('w1700k_gps');
+	let g = (sec) => c.get_all('w1700k_gps', sec) ?? {};
+	let sv = g('serve'), nt = g('ntp'), mq = g('mqtt');
+	/* LAN address: the static one from uci, else (DHCP client / bridged AP) the first global IPv4 address of br-lan */
+	let lan = replace(split(trim(sh('uci -q get network.lan.ipaddr').out), '\n')[0], /\/.*/, '');
+	if (!match(lan, /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/)) {
+		let m = match(sh('ip -4 -o addr show dev br-lan scope global').out, /inet ([0-9.]+)\//);
+		lan = m ? m[1] : '';
+	}
+	let bind = (sv.bind != null && sv.bind != '') ? sv.bind : (match(lan, /^[0-9.]+$/) ? lan : '127.0.0.1');
+	let port = (v, d) => { let n = int(v ?? d); return (n >= 1 && n <= 65535) ? n : d; };
+	return {
+		bind: bind,
+		nmea: sv.nmea_enabled == '1' ? port(sv.nmea_port, 10110) : 0,
+		gpsd: sv.gpsd_enabled == '1' ? port(sv.gpsd_port, 2947) : 0,
+		ntp: nt.enabled == '1' ? port(nt.port, 123) : 0,
+		mqtt: mq.enabled == '1' && mq.host ? {
+			host: mq.host, port: port(mq.port, 1883), user: mq.user, pass: mq.pass,
+			base: (mq.base != null && mq.base != '') ? mq.base : 'w1700k_gps',
+			discovery: mq.discovery != '0', prefix: (mq.prefix != null && mq.prefix != '') ? mq.prefix : 'homeassistant',
+			interval: max(5, int(mq.interval ?? 30))
+		} : null
+	};
+}
+
+// ---------------------------------------------------------------- NTP (own process: answers in milliseconds)
+function u32(n) { return chr((n >> 24) & 255, (n >> 16) & 255, (n >> 8) & 255, n & 255); }
+function ntp_ts(sec, nsec) { return u32(sec + 2208988800) + u32(int(nsec * 4.294967296)); }
+function ntp_short(sec) { let v = int(sec * 65536); return u32(v); }
+
+function run_ntp(cfg) {
+	if (!cfg.ntp)
+		return;
+	let s = socket.create(socket.AF_INET, socket.SOCK_DGRAM);
+	if (!s || !s.bind({ address: cfg.bind, port: cfg.ntp })) {
+		let why = socket.error();
+		put(NTPSTATE, { ok: false, error: 'cannot listen on ' + cfg.bind + ':' + cfg.ntp + (why ? ' (' + why + ')' : ''), port: cfg.ntp, bind: cfg.bind });
+		sh('logger -t w1700k-gps ' + q('NTP server cannot listen on ' + cfg.bind + ':' + cfg.ntp));
+		exit(1);
+	}
+	let served = 0, ignored = 0, tstate = 0, tf = null, last = 0;
+	for (;;) {
+		let t = now();
+		if (t - tstate >= 1) {
+			tstate = t;
+			let st = fs.stat(TIMEF);
+			tf = null;
+			if (st && abs(time() - st.mtime) <= 10) {
+				try { tf = json(fs.readfile(TIMEF)); } catch (e) { tf = null; }
+			}
+			put(NTPSTATE, { ok: true, port: cfg.ntp, bind: cfg.bind, served: served, ignored: ignored, last: last,
+				active: tf != null && tf.fix == true && tf.n >= 8 && tf.jit_ms < 500 });
+		}
+		let r = socket.poll(1000, [ s, socket.POLLIN ]);
+		if (!length(r) || !(r[0][1] & socket.POLLIN))
+			continue;
+		let m = s.recvmsg(512);
+		let t2 = clock();
+		if (!m || type(m.data) != 'string' || length(m.data) < 48)
+			continue;
+		let pk = m.data, fl = ord(pk, 0);
+		let ok = tf != null && tf.fix == true && tf.n >= 8 && tf.jit_ms < 500;
+		if ((fl & 7) != 3 || !ok) {
+			ignored++;
+			continue;
+		}
+		/* GPS-corrected now = router clock minus the median (router clock - GPS) offset */
+		let off = tf.off_ms / 1000;
+		let c = clock();
+		let tx = c[0] + c[1] / 1e9 - off;
+		let rx = t2[0] + t2[1] / 1e9 - off;
+		let ref = tf.at ?? time();
+		let vn = (fl >> 3) & 7;
+		if (vn < 1 || vn > 4)
+			vn = 4;
+		let txs = int(tx), rxs = int(rx);
+		let reply = chr((vn << 3) | 4, 1, 6, 0xf0) + ntp_short(0) + ntp_short(tf.jit_ms / 1000 + 0.02) + 'GPS\0' +
+			ntp_ts(ref, 0) + substr(pk, 40, 8) + ntp_ts(rxs, (rx - rxs) * 1e9) + ntp_ts(txs, (tx - txs) * 1e9);
+		s.send(reply, 0, m.address);
+		served++;
+		last = time();
+	}
+}
+
+// ---------------------------------------------------------------- MQTT 3.1.1 (QoS 0), minimal client
+function m_str(x) { return chr(length(x) >> 8, length(x) & 255) + x; }
+function m_len(n) { let o = []; while (true) { let b = n % 128; n = int(n / 128); push(o, n > 0 ? b | 128 : b); if (n <= 0) break; } return o; }
+function m_pkt(first, body) { return chr(first, ...m_len(length(body))) + body; }
+
+const M = { sock: null, up: false, rx: '', next: 0, lastio: 0, err: null, sent: 0, discovered: false, lastpub: 0, lastkey: null };
+
+function m_close(why) {
+	if (M.sock) { try { M.sock.close(); } catch (e) { } }
+	if (M.up)
+		sh('logger -t w1700k-gps ' + q('MQTT disconnected' + (why ? ': ' + why : '')));
+	M.sock = null; M.up = false; M.rx = ''; M.discovered = false; M.lastkey = null;
+	if (why) M.err = why;
+	M.next = mono_ms() + 10000;
+}
+
+function m_send(x) {
+	if (!M.sock) return false;
+	if (M.sock.send(x) == null) { m_close('send failed'); return false; }
+	M.lastio = mono_ms(); M.sent++;
+	return true;
+}
+function m_pub(topic, payload, retain) { return m_send(m_pkt(0x30 | (retain ? 1 : 0), m_str(topic) + (payload ?? ''))); }
+
+function m_connect(c, id) {
+	let s = socket.connect(c.host, c.port, null, 1500);
+	if (!s) { M.err = 'cannot connect to ' + c.host + ':' + c.port; M.next = mono_ms() + 10000; return; }
+	M.sock = s; M.rx = '';
+	let fl = 0x02 | 0x04 | 0x20;                     /* clean session, retained will */
+	if (c.user) fl |= 0x80;
+	if (c.user && c.pass != null) fl |= 0x40;
+	let body = m_str('MQTT') + chr(4, fl, 0, 60) + m_str('w1700k-gps-' + id) + m_str(c.base + '/availability') + m_str('offline');
+	if (c.user) body += m_str(c.user);
+	if (c.user && c.pass != null) body += m_str(c.pass);
+	M.lastio = mono_ms();
+	m_send(m_pkt(0x10, body));
+}
+
+function m_input(c) {
+	let x = M.sock.recv(65536);
+	if (x == null || length(x) == 0) return m_close(x == null ? 'read failed' : 'closed by the broker');
+	M.rx += x;
+	while (M.sock && length(M.rx) >= 2) {
+		let n = 0, mul = 1, i = 1, b;
+		while (true) {
+			if (i >= length(M.rx)) return;
+			b = ord(M.rx, i++); n += (b & 127) * mul; mul *= 128;
+			if (!(b & 128) || i >= 5) break;
+		}
+		if (length(M.rx) < i + n) return;
+		let first = ord(M.rx, 0), body = substr(M.rx, i, n);
+		M.rx = substr(M.rx, i + n);
+		if ((first >> 4) == 2) {
+			if (n >= 2 && ord(body, 1) == 0) {
+				M.up = true; M.err = null;
+				sh('logger -t w1700k-gps ' + q('MQTT connected to ' + c.host + ':' + c.port));
+				m_pub(c.base + '/availability', 'online', true);
+			} else
+				return m_close('the broker refused the login (code ' + (n >= 2 ? ord(body, 1) : '?') + ')');
+		}
+	}
+}
+
+/* Home Assistant discovery: sensors plus a device tracker, all from one JSON state topic */
+function m_discovery(c, id) {
+	let dev = { identifiers: [ 'w1700k_gps_' + id ], name: 'W1700K GPS', manufacturer: 'Gemtek', model: 'W1700K (Airoha AG3352)' };
+	let ent = (kind, key, extra) => {
+		let o = { name: extra.name, unique_id: 'w1700k_gps_' + id + '_' + key, device: dev, state_topic: c.base + '/state',
+			availability_topic: c.base + '/availability' };
+		for (let k in extra) if (k != 'name') o[k] = extra[k];
+		o.name = extra.name;
+		m_pub(c.prefix + '/' + kind + '/w1700k_gps_' + id + '/' + key + '/config', sprintf('%J', o), true);
+	};
+	let v = (k) => '{{ value_json.' + k + ' }}';
+	ent('sensor', 'satellites_used', { name: 'Satellites used', value_template: v('sats_used'), state_class: 'measurement', icon: 'mdi:satellite-variant' });
+	ent('sensor', 'satellites_in_view', { name: 'Satellites in view', value_template: v('sats_in_view'), state_class: 'measurement', icon: 'mdi:satellite-variant' });
+	ent('sensor', 'fix', { name: 'Fix', value_template: v('fix_text'), icon: 'mdi:crosshairs-gps' });
+	ent('sensor', 'hdop', { name: 'HDOP', value_template: v('hdop'), state_class: 'measurement', entity_category: 'diagnostic' });
+	ent('sensor', 'snr', { name: 'Signal', value_template: v('snr_avg'), unit_of_measurement: 'dB-Hz', state_class: 'measurement', entity_category: 'diagnostic' });
+	ent('sensor', 'altitude', { name: 'Altitude', value_template: v('alt'), unit_of_measurement: 'm', device_class: 'distance', state_class: 'measurement' });
+	ent('sensor', 'speed', { name: 'Speed', value_template: v('speed_kmh'), unit_of_measurement: 'km/h', device_class: 'speed', state_class: 'measurement' });
+	ent('sensor', 'latitude', { name: 'Latitude', value_template: v('lat'), unit_of_measurement: '°', suggested_display_precision: 6 });
+	ent('sensor', 'longitude', { name: 'Longitude', value_template: v('lon'), unit_of_measurement: '°', suggested_display_precision: 6 });
+	let tr = { name: 'Position', unique_id: 'w1700k_gps_' + id + '_tracker', device: dev, json_attributes_topic: c.base + '/state',
+		availability_topic: c.base + '/availability', source_type: 'gps' };
+	m_pub(c.prefix + '/device_tracker/w1700k_gps_' + id + '/tracker/config', sprintf('%J', tr), true);
+}
+
+function m_tick(c, id, snap) {
+	if (!c) { if (M.sock) m_close(null); return; }
+	let t = mono_ms();
+	if (!M.sock) { if (t >= M.next) m_connect(c, id); return; }
+	if (!M.up) { if (t - M.lastio > 10000) m_close('no answer to the login'); return; }
+	if (t - M.lastio > 30000) m_send(chr(0xC0, 0));
+	if (!M.discovered) {
+		M.discovered = true;
+		if (c.discovery)
+			m_discovery(c, id);
+	}
+	let key = sprintf('%s|%s|%d', snap.fix_text, snap.lat, snap.sats_used);
+	if (M.up && (t - M.lastpub >= c.interval * 1000 || key != M.lastkey)) {
+		M.lastpub = t; M.lastkey = key;
+		m_pub(c.base + '/state', sprintf('%J', snap), true);
+	}
+}
+
+// ---------------------------------------------------------------- the daemon
+function gpsd_class(c, o) { return sprintf('%J', c) + '\r\n'; }
+
+function iso(o) {
+	return (o.date && o.time) ? o.date + 'T' + o.time + '.000Z' : null;
+}
+
+const GNSSID = { GPS: 0, Galileo: 2, BeiDou: 3, QZSS: 5, GLONASS: 6, NavIC: 7 };
+
+function gpsd_tpv(o) {
+	let mode = (o.fix && o.fix_type >= 3) ? 3 : (o.fix && o.fix_type == 2) ? 2 : 1;
+	let r = { class: 'TPV', device: DEV, mode: mode };
+	if (iso(o)) r.time = iso(o);
+	if (mode >= 2 && o.lat != null && o.lon != null) {
+		r.lat = o.lat; r.lon = o.lon;
+		if (mode == 3 && o.alt != null) { r.altMSL = o.alt; r.alt = o.alt; }
+		if (o.speed_kmh != null) r.speed = int(o.speed_kmh / 3.6 * 1000 + 0.5) / 1000;
+		if (o.course != null) r.track = o.course;
+	}
+	return r;
+}
+
+function gpsd_sky(o) {
+	let r = { class: 'SKY', device: DEV, nSat: length(o.satellites), uSat: o.sats_used, satellites: [] };
+	if (iso(o)) r.time = iso(o);
+	if (o.hdop != null) r.hdop = o.hdop;
+	if (o.vdop != null) r.vdop = o.vdop;
+	if (o.pdop != null) r.pdop = o.pdop;
+	for (let s in o.satellites)
+		push(r.satellites, { PRN: s.prn, gnssid: GNSSID[s.system] ?? 0, el: s.elevation, az: s.azimuth, ss: s.snr ?? 0, used: s.used });
+	return r;
+}
+
+function mq_snapshot(o) {
+	let fix = (o.fix && o.fix_type >= 3) ? '3D fix' : (o.fix && o.fix_type == 2) ? '2D fix' : o.sentences ? 'no fix' : 'no data';
+	let r = { fix: o.fix == true, fix_text: fix, sats_used: o.sats_used, sats_in_view: o.sats_in_view, hdop: o.hdop, pdop: o.pdop,
+		snr_avg: o.snr_avg, time: iso(o) };
+	if (o.fix && o.lat != null && o.lon != null) {
+		r.lat = o.lat; r.lon = o.lon; r.latitude = o.lat; r.longitude = o.lon; r.alt = o.alt; r.speed_kmh = o.speed_kmh; r.course = o.course;
+		if (o.hdop != null) r.gps_accuracy = int(o.hdop * 5 + 0.5);   /* rough: HDOP x ~5 m user range error */
+	}
+	return r;
+}
+
+function run(cfg) {
+	if (!cfg.nmea && !cfg.gpsd && !cfg.mqtt && !cfg.ntp) {
+		fs.unlink(BURST);
+		return;
+	}
+	let id = replace(trim(fs.readfile('/sys/class/net/br-lan/address') ?? fs.readfile('/sys/class/net/eth0/address') ?? 'unknown'), ':', '');
+	let ls = [];
+	let listen = (port, kind) => {
+		if (!port) return;
+		let s = socket.listen(cfg.bind, '' + port, null, 8);
+		if (!s) {
+			sh('logger -t w1700k-gps ' + q('cannot listen on ' + cfg.bind + ':' + port + ' for ' + kind));
+			push(ls, { s: null, kind: kind, port: port, error: 'cannot listen on ' + cfg.bind + ':' + port });
+			return;
+		}
+		push(ls, { s: s, kind: kind, port: port });
+	};
+	listen(cfg.nmea, 'nmea');
+	listen(cfg.gpsd, 'gpsd');
+	let clients = [];
+	let keep = null, need_stty = true, rx = '', ring = [], lastwrite = 0, lastst = 0, snap = null, yielded = 0, lines_total = 0;
+	let offs = [], tstat = { n: 0, off_ms: null, jit_ms: null }, ver = sprintf('%J', { class: 'VERSION', release: '3.25', rev: 'w1700k-gps', proto_major: 3, proto_minor: 14 }) + '\r\n';
+
+	let drop = (c) => { try { c.s.close(); } catch (e) { } c.dead = true; };
+	let send = (c, data) => {
+		if (c.dead) return;
+		let n = c.s.send(data, socket.MSG_DONTWAIT | socket.MSG_NOSIGNAL);
+		if (n == null || n < length(data)) drop(c);        /* a client that does not keep up is cut off */
+	};
+	let watch_reply = (c) => sprintf('%J', { class: 'WATCH', enable: c.json || c.nmea, json: c.json, nmea: c.nmea, raw: 0, scaled: false, timing: false, split24: false, pps: false }) + '\r\n';
+	let dev_reply = () => sprintf('%J', { class: 'DEVICES', devices: [ { class: 'DEVICE', path: DEV, driver: 'NMEA0183', activated: sprintf('%s', iso(snap ?? {}) ?? ''), flags: 1, native: 0, bps: BAUD, parity: 'N', stopbits: 1, cycle: 1 } ] }) + '\r\n';
+
+	function command(c, cmd) {
+		let m = match(trim(cmd), /^\?([A-Za-z]+)(=(.*?))?;?$/);
+		if (!m) return;
+		let name = uc(m[1]);
+		if (name == 'WATCH') {
+			let a = null;
+			try { a = json(m[3] ?? '{}'); } catch (e) { a = {}; }
+			if (type(a) != 'object') a = {};
+			let en = a.enable != false;
+			c.json = en && a.json == true;
+			c.nmea = en && a.nmea == true;
+			send(c, dev_reply());
+			send(c, watch_reply(c));
+		} else if (name == 'VERSION') send(c, ver);
+		else if (name == 'DEVICES') send(c, dev_reply());
+		else if (name == 'POLL') {
+			if (snap)
+				send(c, sprintf('%J', { class: 'POLL', time: iso(snap), active: 1, tpv: [ gpsd_tpv(snap) ], sky: [ gpsd_sky(snap) ] }) + '\r\n');
+		}
+	}
+
+	function service(timeout) {
+		let h = [];
+		for (let l in ls) if (l.s) push(h, [ l.s, socket.POLLIN ]);
+		for (let c in clients) if (!c.dead) push(h, [ c.s, socket.POLLIN ]);
+		if (M.sock) push(h, [ M.sock, socket.POLLIN ]);
+		if (!length(h)) {
+			if (timeout > 0) fs.popen('sleep 0.1', 'r').close();
+			return;
+		}
+		let r = socket.poll(timeout, ...h);
+		for (let e in r) {
+			if (!(e[1] & (socket.POLLIN | socket.POLLHUP | socket.POLLERR)))
+				continue;
+			let hd = e[0];
+			let lst = null;
+			for (let l in ls) if (l.s == hd) lst = l;
+			if (lst) {
+				let a = hd.accept();
+				if (!a) continue;
+				let n = 0;
+				for (let c in clients) if (!c.dead && c.kind == lst.kind) n++;
+				if (n >= MAXC) { a.close(); continue; }
+				let cl = { s: a, kind: lst.kind, rx: '', json: false, nmea: lst.kind == 'nmea', dead: false, peer: a.peername() };
+				push(clients, cl);
+				if (lst.kind == 'gpsd') send(cl, ver);
+				continue;
+			}
+			if (M.sock && hd == M.sock) { m_input(cfg.mqtt); continue; }
+			for (let c in clients) {
+				if (c.dead || c.s != hd) continue;
+				let d = c.s.recv(1024);
+				if (d == null || length(d) == 0) { drop(c); continue; }
+				if (c.kind != 'gpsd') continue;          /* raw NMEA clients are listen-only; whatever they send is ignored */
+				c.rx += d;
+				if (length(c.rx) > 2048) c.rx = '';
+				let parts = split(c.rx, /[;\n]/);
+				c.rx = pop(parts);
+				for (let p in parts) command(c, p);
+			}
+		}
+		clients = filter(clients, (c) => !c.dead);
+	}
+
+	function ingest(chunk, t_end) {
+		let backlog = length(chunk) >= 3000;       /* a full read is old data queued up, not a live arrival time */
+		rx += chunk;
+		let parts = split(rx, '\n');
+		rx = pop(parts);
+		if (length(rx) > 4096) rx = '';
+		for (let l in parts) {
+			l = trim(l);
+			let at = index(l, '$');
+			if (at < 0) continue;
+			if (at > 0) l = substr(l, at);
+			let f = parse(l);
+			if (!f) continue;
+			lines_total++;
+			push(ring, [ t_end, l ]);
+			for (let c in clients)
+				if (c.nmea && !c.dead) send(c, l + '\r\n');
+			if (substr(f[0], 2) == 'RMC' && f[2] == 'A' && length(f[1]) >= 6 && length(f[9]) == 6) {
+				let ep = gps_epoch('20' + substr(f[9], 4, 2) + '-' + substr(f[9], 2, 2) + '-' + substr(f[9], 0, 2),
+					substr(f[1], 0, 2) + ':' + substr(f[1], 2, 2) + ':' + substr(f[1], 4, 2));
+				if (ep != null && ep >= MIN_EPOCH && !backlog) {
+					/* data arrived ~0.1 s before the read returned (the idle wait of the read cycle) */
+					push(offs, (t_end - 0.1) - (ep + (num(substr(f[1], 6)) ?? 0)));
+					if (length(offs) > 120) shift(offs);
+				}
+			}
+		}
+	}
+
+	function second(t) {
+		/* last 2.5 s of sentences: what the status page parses */
+		ring = filter(ring, (e) => t - e[0] <= 2.5);
+		let lines = map(ring, (e) => e[1]);
+		if (length(lines)) {
+			fs.writefile(BURST + '.new', join('\n', lines) + '\n');
+			fs.rename(BURST + '.new', BURST);
+			snap = analyze(lines, true);
+			for (let c in clients)
+				if (c.json && !c.dead) {
+					send(c, sprintf('%J', gpsd_tpv(snap)) + '\r\n');
+					send(c, sprintf('%J', gpsd_sky(snap)) + '\r\n');
+				}
+		} else {
+			snap = null;
+		}
+		let n = length(offs);
+		if (n) {
+			let so = sort(slice(offs)), med = so[int(n / 2)];
+			/* jitter = robust spread (median absolute deviation x 1.48), one odd read cycle does not inflate it */
+			let dev = sort(map(offs, (v) => v < med ? med - v : v - med));
+			tstat = { n: n, off_ms: int(med * 1e6) / 1000, jit_ms: int(dev[int(n / 2)] * 1.48 * 1e6) / 1000 };
+		}
+		let fixed = snap != null && snap.fix == true;
+		put(TIMEF, { fix: fixed, n: tstat.n, off_ms: tstat.off_ms, jit_ms: tstat.jit_ms, at: time() });
+	}
+
+	for (;;) {
+		let t = now();
+		/* port: skip it while another tool holds the lock (and close our handle so the tool's stty is the only config) */
+		if (fs.stat(LOCK)) {
+			if (keep) { keep.close(); keep = null; }
+			need_stty = true;
+			yielded++;
+			ring = [];
+			service(100);
+		} else {
+			if (!keep)
+				keep = fs.open(DEV, 'r');
+			if (need_stty) {
+				sh('stty -F ' + DEV + (FAKE ? '' : ' ' + BAUD) + ' raw clocal -crtscts -hupcl -echo cs8 -parenb -cstopb min 0 time 1');
+				need_stty = false;
+			}
+			service(0);
+			let f = fs.open(DEV, 'r');
+			let d = f ? f.read(4096) : null;
+			if (f) f.close();
+			else fs.popen('sleep 1', 'r').close();
+			if (d && length(d))
+				ingest(d, now());
+		}
+		t = now();
+		if (t - lastwrite >= 1) {
+			lastwrite = t;
+			second(t);
+			if (snap)
+				m_tick(cfg.mqtt, id, mq_snapshot(snap));
+			else
+				m_tick(cfg.mqtt, id, { fix: false, fix_text: 'no data', sats_used: 0, sats_in_view: 0 });
+		}
+		if (t - lastst >= 2) {
+			lastst = t;
+			let cn = (k) => length(filter(clients, (c) => c.kind == k));
+			let lp = (k) => { for (let l in ls) if (l.kind == k) return l; return null; };
+			let ln = lp('nmea'), lg = lp('gpsd');
+			put(STATE, {
+				bind: cfg.bind, lines: lines_total, yielded: yielded,
+				nmea: ln ? { port: ln.port, clients: cn('nmea'), error: ln.error } : null,
+				gpsd: lg ? { port: lg.port, clients: cn('gpsd'), error: lg.error } : null,
+				mqtt: cfg.mqtt ? { host: cfg.mqtt.host, port: cfg.mqtt.port, connected: M.up, error: M.err, sent: M.sent, base: cfg.mqtt.base } : null,
+				time: { n: tstat.n, off_ms: tstat.off_ms, jit_ms: tstat.jit_ms, pps_device: fs.stat('/dev/pps0') != null },
+				fix: snap != null && snap.fix == true
+			});
+		}
+	}
+}
+
+let cfg = load_cfg();
+if (ARGV[0] == 'run')
+	run(cfg);
+else if (ARGV[0] == 'ntp')
+	run_ntp(cfg);
+else
+	print('usage: w1700k-gps-serve run|ntp\n');
