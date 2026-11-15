@@ -78,11 +78,12 @@ return view.extend({
 		o = s.option(form.Value, 'vendor', _('Vendor'));
 		o.password = true;
 		o.rmempty = false;
-		o.description = _('Identifies the customer to the EPO service. Stored in /etc/config/w1700k_gps, readable by root only.');
+		o.description = _('Identifies the customer to the EPO service. Not pre-filled: on a stock Gemtek firmware the value is kept in /etc/config/axon_platform_manager (property axon.gps.anld.config.epoVendor); the image itself ships it blank. Stored here in /etc/config/w1700k_gps, readable by root only.');
 
 		o = s.option(form.Value, 'project', _('Project'));
 		o.password = true;
 		o.rmempty = false;
+		o.description = _('Not pre-filled. On a stock Gemtek firmware it is kept in /etc/config/axon_platform_manager (property axon.gps.anld.config.epoProject), so read it from a backup of the original firmware's config filesystem.');
 
 		o = s.option(form.Value, 'device_id', _('Device ID'));
 		o.password = true;

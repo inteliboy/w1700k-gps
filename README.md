@@ -68,10 +68,26 @@ Everything is in `/etc/config/w1700k_gps` (root-only, mode 0600) and the **Setti
 
 ### Satellite prediction (EPO) credentials
 
-The EPO service wants a vendor name, a project token and a device ID. **This repository does not ship any.**
-The device ID is generated randomly at install. The vendor and project values are the ones the stock
-firmware of your device uses; you need to enter them yourself in the Settings tab. Without them the EPO
-service stays idle and everything else works. Use of the EPO service is subject to its operator's terms.
+The EPO service wants a vendor name, a project token and a device ID. **This repository ships none of them and
+nothing is pre-filled**; the EPO service stays idle until you enter vendor and project in the Settings tab
+(everything else works without it). The device ID is generated randomly at install. Use of the EPO service is
+subject to its operator's terms.
+
+Where to find the vendor and project values of your device, from the original (stock) firmware:
+
+* The stock image ships them **blank**: `/etc/default/anld/anld.conf` has empty `EPO vendor=`, `EPO project=` and
+  `EPO device id=` lines (host `wpepodownload.mediatek.com`), and `/usr/bin/anld` builds
+  `http://<host>/EPO_GR_3_<n>.DAT?vendor=..&project=..&device_id=..` from them.
+* On a running stock device the values are held by the Axon platform manager in its persistent settings
+  (JSON, the "General Settings" pool), properties `axon.gps.anld.config.epoVendor`, `epoProject` and
+  `epoDeviceId`, normally in **`/etc/config/axon_platform_manager`** (a second copy may exist under
+  `/mnt/config/`). So you read them from a backup of the **original firmware's config/overlay filesystem**
+  (or from the live stock device), not from the image itself.
+* They are **not** in the raw flash partition dumps (bootloader/U-Boot env/DSD "vendor" partition, Wi-Fi
+  calibration "factory" partition): checked on one device, neither contains them.
+
+This location comes from reverse engineering the stock `anld` and `axon_platform_manager` binaries; it was not
+confirmed on a stock device that has non-blank values, so treat it as a pointer, not a guarantee.
 
 ## Security notes
 
