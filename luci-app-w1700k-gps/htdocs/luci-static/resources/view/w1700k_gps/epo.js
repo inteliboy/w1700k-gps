@@ -83,7 +83,7 @@ return view.extend({
 		o = s.option(form.Value, 'project', _('Project'));
 		o.password = true;
 		o.rmempty = false;
-		o.description = _('Not pre-filled. On a stock Gemtek firmware it is kept in /etc/config/axon_platform_manager (property axon.gps.anld.config.epoProject), so read it from a backup of the original firmware's config filesystem.');
+		o.description = _('Not pre-filled. On a stock Gemtek firmware it is kept in /etc/config/axon_platform_manager (property axon.gps.anld.config.epoProject), so read it from a backup of the original firmware config filesystem.');
 
 		o = s.option(form.Value, 'device_id', _('Device ID'));
 		o.password = true;
