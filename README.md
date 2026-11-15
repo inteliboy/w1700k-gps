@@ -75,19 +75,36 @@ subject to its operator's terms.
 
 Where to find the vendor and project values of your device, from the original (stock) firmware:
 
-* The stock image ships them **blank**: `/etc/default/anld/anld.conf` has empty `EPO vendor=`, `EPO project=` and
-  `EPO device id=` lines (host `wpepodownload.mediatek.com`), and `/usr/bin/anld` builds
-  `http://<host>/EPO_GR_3_<n>.DAT?vendor=..&project=..&device_id=..` from them.
-* On a running stock device the values are held by the Axon platform manager in its persistent settings
-  (JSON, the "General Settings" pool), properties `axon.gps.anld.config.epoVendor`, `epoProject` and
-  `epoDeviceId`, normally in **`/etc/config/axon_platform_manager`** (a second copy may exist under
-  `/mnt/config/`). So you read them from a backup of the **original firmware's config/overlay filesystem**
-  (or from the live stock device), not from the image itself.
-* They are **not** in the raw flash partition dumps (bootloader/U-Boot env/DSD "vendor" partition, Wi-Fi
-  calibration "factory" partition): checked on one device, neither contains them.
+* The stock firmware **image** ships them blank (`/etc/default/anld/anld.conf`). On a running stock device the
+  Axon platform manager keeps the real values in its persistent settings, `/etc/config/axon_platform_manager`
+  (JSON, properties `axon.gps.anld.config.epoVendor`, `epoProject`, `epoDeviceId`).
+* **They can be read from a raw MTD flash backup of the original firmware.** That file lives on the big
+  writable `system` partition (the ~312 MiB one, `mtd9.bin` in a typical `mtd0.bin`...`mtd9.bin` dump taken from
+  the stock device, for example `Y:lash_backup\mtd9.bin`). The flash is a log-structured filesystem, so the
+  settings file shows up as plain text, usually several times (older copies of the same file). The small
+  partitions (`mtd0`-`mtd2` bootloader, U-Boot environment and device data, and the Wi-Fi calibration partition)
+  do not contain them.
 
-This location comes from reverse engineering the stock `anld` and `axon_platform_manager` binaries; it was not
-confirmed on a stock device that has non-blank values, so treat it as a pointer, not a guarantee.
+  ```sh
+  # Linux / WSL / Git Bash
+  strings -a mtd9.bin | grep -A1 -E 'epoVendor|epoProject' | head -20
+  ```
+  ```python
+  # anywhere with Python 3
+  d = open('mtd9.bin', 'rb').read()
+  for key in (b'epoVendor', b'epoProject'):
+      i = d.find(key)
+      print(key.decode(), d[i:i + 80])
+  ```
+
+  The vendor is a short word and the project a 43 character token (letters, digits, `-` and `_`) right after
+  its key name. Compressed flash nodes put a few binary bytes between the key and the value; ignore those.
+  The same file also holds `epoDeviceId`, which is unique to the original device. You do **not** need it:
+  this package generates its own random device ID.
+* They are specific to your device family's firmware; do not publish them.
+
+Verified by finding both values in the raw `mtd9` dump of one stock device. Nobody has confirmed here that the
+EPO server keeps accepting them, or that other firmware versions store them in the same place.
 
 ## Security notes
 
